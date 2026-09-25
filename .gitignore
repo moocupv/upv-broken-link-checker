@@ -1,0 +1,19 @@
+# Local settings and credentials
+config.ini
+smtp.env
+.env
+
+# Runtime state and reports
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.lock
+reports/
+cron.log
+
+# Python environments and caches
+venv/
+.venv/
+__pycache__/
+*.py[cod]

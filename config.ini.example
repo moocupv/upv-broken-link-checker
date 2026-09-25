@@ -1,0 +1,48 @@
+[paths]
+database = /opt/broken_links_checker/state.sqlite3
+reports = /opt/broken_links_checker/reports
+
+[crawl]
+start_url = https://www.upv.es/
+user_agent = UPV-BrokenLinks-Audit/1.0 (+mailto:webmaster@upv.es)
+respect_robots_txt = yes
+; Follows public HTTP(S) links on any domain up to the configured depth.
+; Allow local/private hosts only in a controlled test environment.
+allow_private_hosts = no
+; Level 0: portada only. Each link hop increments the level by one.
+; A round starts at least N days after the previous round started,
+; and never before the previous round finishes.
+level_schedule = 0:1;1:1;2:1;3:4
+db_retention_days = 30
+report_timezone = Europe/Madrid
+max_pages_per_run = 10000
+; Counts attempted requests, including redirects, retries and robots.txt.
+max_http_requests_per_run = 50000
+link_ttl_days = 1
+timeout_seconds = 15
+; Minimum time between requests to the same host (including robots and redirects).
+min_interval_seconds = 1.0
+; Overall cap, even when links point to many distinct hosts.
+min_global_interval_seconds = 0.2
+; If Retry-After exceeds this, pause the host for the rest of the run.
+max_retry_wait_seconds = 30
+; Leave a margin before the next daily cron invocation.
+max_duration_hours = 20
+max_html_bytes = 1048576
+; One expression per line; match conservatively to avoid false alarms.
+soft_404_patterns =
+    MicroWebServicio\s*:\s*ORA-29262
+    ORA-29262\s*:\s*URL\s+err[oó]nea
+
+[mail]
+enabled = no
+smtp_server_address = smtp.example.org
+smtp_server_port = 587
+smtp_protocol = starttls
+; Credentials live in smtp.env, loaded by cron, not in this INI.
+user_env = UPV_SMTP_USER
+password_env = UPV_SMTP_PASSWORD
+; Optional; when empty, use UPV_SMTP_USER as sender.
+from_address =
+recipients = webmaster@example.org
+max_inline_rows = 200

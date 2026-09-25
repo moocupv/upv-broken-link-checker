@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""Incremental, robots-aware link audit. Run periodically with cron."""
+import argparse
+import configparser
+import csv
+import fcntl
+import ipaddress
+import logging
+import os
+import re
+import smtplib
+import sqlite3
+import sys
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+from urllib.parse import urldefrag, urljoin, urlsplit, urlunsplit
+from urllib.robotparser import RobotFileParser
+
+import requests
+from bs4 import BeautifulSoup, UnicodeDammit
+
+LOG = logging.getLogger("linkcheck")
+SKIP_SCHEMES = ("mailto:", "tel:", "javascript:", "data:", "blob:")
+NON_HTML = re.compile(r"\.(?:pdf|zip|gz|jpg|jpeg|png|gif|svg|webp|mp4|mp3|docx?|xlsx?|pptx?|css|js|xml|json|ics|woff2?)$", re.I)
+UA = "UPV-BrokenLinks-Audit/1.0 (+mailto:webmaster@upv.es)"
+
+
+class RunLimit(Exception):
+    """Stop cleanly when the daily time budget runs out."""
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def normalize(raw, base=None):
+    if not raw or raw.strip().lower().startswith(SKIP_SCHEMES):
+        return None
+    raw = urljoin(base, raw.strip()) if base else raw.strip()
+    raw, _ = urldefrag(raw)
+    p = urlsplit(raw)
+    if p.scheme.lower() not in ("http", "https") or not p.hostname:
+        return None
+    try:
+        port = p.port
+    except ValueError:
+        return None
+    host = p.hostname.lower()
+    if host == "upv.es":
+        host = "www.upv.es"
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = host + (f":{port}" if port and port != (443 if p.scheme.lower() == "https" else 80) else "")
+    return urlunsplit((p.scheme.lower(), netloc, p.path or "/", p.query, ""))
+
+
+def crawlable(url):
+    p = urlsplit(url)
+    return not NON_HTML.search(p.path)
+
+
+def parse_level_schedule(value):
+    """0:1;1:1;2:1;3:4 sets the minimum days between starts by depth."""
+    result = {}
+    previous_days = 0
+    for item in value.split(";"):
+        parts = item.strip().split(":")
+        if len(parts) != 2 or not all(part.strip().isdigit() for part in parts):
+            raise ValueError("level_schedule debe tener el formato 0:1;1:1;2:1;3:4")
+        level, days = (int(part.strip()) for part in parts)
+        if level in result or not (0 <= level <= 20 and 1 <= days <= 365):
+            raise ValueError("Niveles únicos entre 0 y 20 y días entre 1 y 365")
+        result[level] = days
+    if sorted(result) != list(range(len(result))):
+        raise ValueError("Los niveles deben ser consecutivos desde 0")
+    for level in sorted(result):
+        if result[level] < previous_days:
+            LOG.warning("Nivel %s: %s días se elevan a %s para respetar la frecuencia del nivel anterior",
+                        level, result[level], previous_days)
+            result[level] = previous_days
+        previous_days = result[level]
+    return result
+
+
+def public_host(url):
+    host = urlsplit(url).hostname or ""
+    if host.lower() == "localhost" or host.lower().endswith(".localhost") or host.lower().endswith(".local"):
+        return False
+    try:
+        return ipaddress.ip_address(host).is_global
+    except ValueError:
+        return True
+
+
+def connect(path):
+    db = sqlite3.connect(path)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS pages (
+            url TEXT PRIMARY KEY, checked_at TEXT, next_due TEXT, priority INTEGER NOT NULL DEFAULT 0,
+            level INTEGER, completed_round INTEGER NOT NULL DEFAULT 0, retry_at TEXT,
+            last_completed_execution TEXT
+        );
+        CREATE TABLE IF NOT EXISTS links (
+            source TEXT NOT NULL, target TEXT NOT NULL, anchor TEXT NOT NULL,
+            PRIMARY KEY(source, target, anchor)
+        );
+        CREATE TABLE IF NOT EXISTS checks (
+            url TEXT PRIMARY KEY, checked_at TEXT NOT NULL,
+            result TEXT NOT NULL, detail TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS pages_due ON pages(next_due, priority);
+        CREATE INDEX IF NOT EXISTS links_target ON links(target);
+        CREATE TABLE IF NOT EXISTS level_rounds (
+            level INTEGER PRIMARY KEY, round_number INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 0, next_start_at TEXT, started_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    """)
+    # Preserve an existing SQLite database created by earlier script versions.
+    columns = {row[1] for row in db.execute("PRAGMA table_info(pages)")}
+    for name, declaration in (("level", "INTEGER"), ("completed_round", "INTEGER NOT NULL DEFAULT 0"),
+                              ("retry_at", "TEXT"), ("last_completed_execution", "TEXT")):
+        if name not in columns:
+            db.execute(f"ALTER TABLE pages ADD COLUMN {name} {declaration}")
+    round_columns = {row[1] for row in db.execute("PRAGMA table_info(level_rounds)")}
+    if "started_at" not in round_columns:
+        db.execute("ALTER TABLE level_rounds ADD COLUMN started_at TEXT")
+    db.execute("CREATE INDEX IF NOT EXISTS pages_round ON pages(level, completed_round, retry_at)")
+    if not db.execute("SELECT 1 FROM schema_meta WHERE key='level_origin_home0'").fetchone():
+        # Previous versions used both home and map as level-1 roots. Their
+        # distances cannot be shifted: recompute reachability from home.
+        db.execute("UPDATE pages SET level=NULL,completed_round=0,retry_at=NULL")
+        db.execute("DELETE FROM level_rounds")
+        db.execute("INSERT INTO schema_meta(key,value) VALUES('level_origin_home0','1')")
+        db.commit()
+    return db
+
+
+def start_and_finish_rounds(db, schedule):
+    """Complete exhausted rounds and start due rounds, including freshly discovered levels."""
+    for level, days in schedule.items():
+        db.execute("INSERT OR IGNORE INTO level_rounds(level) VALUES(?)", (level,))
+        round_number, active, next_start, started_at = db.execute(
+            "SELECT round_number,active,next_start_at,started_at FROM level_rounds WHERE level=?", (level,)).fetchone()
+        if active and not db.execute(
+            "SELECT 1 FROM pages WHERE level=? AND completed_round<? LIMIT 1", (level, round_number)).fetchone():
+            next_start = max(datetime.fromisoformat(started_at) + timedelta(days=days),
+                             datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+            db.execute("UPDATE level_rounds SET active=0,next_start_at=? WHERE level=?", (next_start, level))
+            active = 0
+            LOG.info("Ronda %s del nivel %s completada; siguiente después de %s", round_number, level, next_start)
+        if not active and (next_start is None or next_start <= now()) and db.execute(
+            "SELECT 1 FROM pages WHERE level=? LIMIT 1", (level,)).fetchone():
+            db.execute("UPDATE level_rounds SET round_number=round_number+1,active=1,started_at=? WHERE level=?", (now(), level))
+            LOG.info("Ronda del nivel %s iniciada", level)
+
+
+def prune_old_data(db, days, root):
+    """Discard stale observations without deleting the active crawl frontier."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    db.execute("DELETE FROM checks WHERE checked_at < ?", (cutoff,))
+    db.execute("""DELETE FROM pages WHERE url != ? AND checked_at IS NOT NULL AND checked_at < ?
+        AND NOT EXISTS (SELECT 1 FROM level_rounds r WHERE r.level=pages.level
+                        AND r.active=1)""", (root, cutoff))
+    db.execute("DELETE FROM links WHERE source NOT IN (SELECT url FROM pages)")
+
+
+class Auditor:
+    def __init__(self, cfg, db):
+        self.cfg, self.db = cfg, db
+        self.level_schedule = parse_level_schedule(cfg.get("crawl", "level_schedule"))
+        self.retention_days = cfg.getint("crawl", "db_retention_days")
+        if self.retention_days < max(self.level_schedule.values()):
+            raise ValueError("db_retention_days no puede ser menor que el intervalo mayor de level_schedule")
+        self.local_tz = ZoneInfo(cfg.get("crawl", "report_timezone", fallback="Europe/Madrid"))
+        self.allow_private = cfg.getboolean("crawl", "allow_private_hosts", fallback=False)
+        self.patterns = [re.compile(x.strip(), re.I) for x in cfg.get("crawl", "soft_404_patterns").splitlines() if x.strip()]
+        self.timeout = cfg.getfloat("crawl", "timeout_seconds")
+        self.max_bytes = cfg.getint("crawl", "max_html_bytes")
+        self.agent = cfg.get("crawl", "user_agent", fallback=UA)
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": self.agent})
+        self.robots = {}
+        self.unknown_cache = {}
+        self.next_request = {}
+        self.blocked_hosts = set()
+        self.interval = cfg.getfloat("crawl", "min_interval_seconds", fallback=1.)
+        self.global_interval = cfg.getfloat("crawl", "min_global_interval_seconds", fallback=0.2)
+        self.next_global_request = 0.
+        self.max_retry_wait = cfg.getfloat("crawl", "max_retry_wait_seconds", fallback=30.)
+        self.deadline = time.monotonic() + cfg.getfloat("crawl", "max_duration_hours", fallback=20.) * 3600
+        self.request_limit = cfg.getint("crawl", "max_http_requests_per_run", fallback=50000)
+        self.stats = {"pages": 0, "checked": 0, "unknown": 0, "robots": 0, "throttled": 0, "levels": set()}
+
+    def ensure_time(self):
+        if time.monotonic() >= self.deadline:
+            raise RunLimit("Tiempo máximo de ejecución alcanzado")
+        if self.stats["checked"] >= self.request_limit:
+            raise RunLimit("Límite de solicitudes HTTP alcanzado")
+
+    def pause(self, seconds):
+        self.ensure_time()
+        if seconds > 0:
+            if time.monotonic() + seconds >= self.deadline:
+                raise RunLimit("Tiempo máximo de ejecución alcanzado")
+            time.sleep(seconds)
+
+    def retry_after(self, value, attempt):
+        if value:
+            try:
+                return max(0., float(value))
+            except ValueError:
+                try:
+                    return max(0., (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds())
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        return min(60., 2. ** (attempt + 2))
+
+    def request(self, url, stream=True):
+        """One paced HTTP transaction, with bounded retries and a per-host circuit breaker."""
+        if not self.allow_private and not public_host(url):
+            return None, "host privado o local excluido"
+        host = urlsplit(url).netloc.lower()
+        if host in self.blocked_hosts:
+            return None, "host pausado por throttling"
+        for attempt in range(3):
+            self.pause(max(0., self.next_request.get(host, 0.) - time.monotonic(),
+                           self.next_global_request - time.monotonic()))
+            # Space requests by host, including unsuccessful attempts and robots.txt.
+            self.next_request[host] = time.monotonic() + self.interval
+            self.next_global_request = time.monotonic() + self.global_interval
+            self.ensure_time()
+            # Count attempts, including redirects, retries, and network failures.
+            self.stats["checked"] += 1
+            try:
+                response = self.session.get(url, timeout=self.timeout, stream=stream, allow_redirects=False)
+            except requests.RequestException as e:
+                return None, f"{type(e).__name__}: {str(e)[:180]}"
+            if response.status_code not in (429, 503):
+                return response, None
+            self.stats["throttled"] += 1
+            wait = self.retry_after(response.headers.get("Retry-After"), attempt)
+            response.close()
+            if wait > self.max_retry_wait or attempt == 2:
+                self.blocked_hosts.add(host)
+                LOG.warning("Host pausado hasta la siguiente ejecución: %s (HTTP 429/503)", host)
+                return None, f"HTTP 429/503; host pausado (Retry-After: {wait:.0f}s)"
+            self.pause(max(wait, self.interval))
+        raise AssertionError("unreachable")
+
+    def allowed(self, url):
+        if not self.cfg.getboolean("crawl", "respect_robots_txt"):
+            return True
+        p = urlsplit(url)
+        root = f"{p.scheme}://{p.netloc}"
+        if root not in self.robots:
+            robots_url = root + "/robots.txt"
+            try:
+                for _ in range(6):
+                    response, error = self.request(robots_url, stream=False)
+                    if response is not None and response.status_code in (301, 302, 303, 307, 308) and response.headers.get("Location"):
+                        with response:
+                            robots_url = normalize(response.headers["Location"], robots_url)
+                        if not robots_url:
+                            response = None
+                            break
+                        continue
+                    break
+                if response is None:
+                    # A throttled host can recover on the next cron execution.
+                    if urlsplit(robots_url).netloc.lower() not in self.blocked_hosts:
+                        self.robots[root] = None
+                    return False
+                with response:
+                    parser = RobotFileParser()
+                    if 400 <= response.status_code < 500:
+                        parser.parse([])  # RFC 9309: unavailable robots permits access.
+                    else:
+                        response.raise_for_status()
+                        parser.parse(response.text.splitlines())
+                    self.robots[root] = parser
+            except requests.RequestException as e:
+                LOG.warning("Robots no disponible %s: %s; se omite este host en esta ejecución", root, e)
+                self.robots[root] = None
+        parser = self.robots[root]
+        return parser is not None and parser.can_fetch(self.agent, url)
+
+    def fetch(self, url):
+        """Return result, detail, HTML (or None). Never load entire binary resources."""
+        try:
+            for _ in range(6):
+                response, error = self.request(url)
+                if response is None:
+                    return "unknown", error, None, url
+                if response.status_code in (301, 302, 303, 307, 308) and response.headers.get("Location"):
+                    with response:
+                        url = normalize(response.headers["Location"], url)
+                    if not url:
+                        return "unknown", "redirección no HTTP", None, url
+                    if not self.allowed(url):
+                        return "unknown", "redirección excluida por robots.txt", None, url
+                    continue
+                break
+            else:
+                return "unknown", "demasiadas redirecciones", None, url
+            with response:
+                status = response.status_code
+                if status in (401, 403, 408, 429) or status >= 500:
+                    return "unknown", f"HTTP {status}", None, url
+                if status >= 400:
+                    return "broken", f"HTTP {status}", None, url
+                if status < 200:
+                    return "unknown", f"HTTP {status}", None, url
+                mime = response.headers.get("Content-Type", "").lower()
+                # Mislabelled responses with no Content-Type can still be HTML.
+                is_html = "text/html" in mime or "application/xhtml+xml" in mime or (not mime and not NON_HTML.search(urlsplit(url).path))
+                if not is_html:
+                    return "ok", f"HTTP {status}", None, url
+                data = bytearray()
+                for chunk in response.iter_content(chunk_size=16384):
+                    data.extend(chunk[:max(0, self.max_bytes - len(data))])
+                    if len(data) >= self.max_bytes:
+                        break
+                html = UnicodeDammit(bytes(data), is_html=True).unicode_markup or bytes(data).decode("utf-8", errors="replace")
+                for pattern in self.patterns:
+                    if pattern.search(html):
+                        return "broken", "soft-404: " + pattern.pattern, None, url
+                return "ok", f"HTTP {status}", html, url
+        except requests.RequestException as e:
+            return "unknown", f"{type(e).__name__}: {str(e)[:180]}", None, url
+
+    def check(self, url, ttl_days, force=False):
+        row = self.db.execute("SELECT checked_at,result,detail FROM checks WHERE url=?", (url,)).fetchone()
+        if not force and row and datetime.fromisoformat(row[0]) > datetime.now(timezone.utc) - timedelta(days=ttl_days):
+            return row[1], row[2], None
+        if url in self.unknown_cache:
+            return "unknown", self.unknown_cache[url], None
+        if not self.allowed(url):
+            self.stats["robots"] += 1
+            return "unknown", "excluido por robots.txt", None
+        result, detail, html, _ = self.fetch(url)
+        if result == "unknown":
+            self.stats["unknown"] += 1
+            self.unknown_cache[url] = detail
+        else:
+            self.db.execute("INSERT OR REPLACE INTO checks VALUES (?,?,?,?)", (url, now(), result, detail))
+        return result, detail, html
+
+    def enqueue(self, url, level):
+        if level in self.level_schedule and crawlable(url) and (self.allow_private or public_host(url)):
+            self.db.execute("""
+                INSERT INTO pages(url,level) VALUES(?,?)
+                ON CONFLICT(url) DO UPDATE SET
+                    completed_round=CASE WHEN pages.level IS NULL OR pages.level>excluded.level THEN 0 ELSE pages.completed_round END,
+                    retry_at=CASE WHEN pages.level IS NULL OR pages.level>excluded.level THEN NULL ELSE pages.retry_at END,
+                    level=CASE WHEN pages.level IS NULL OR pages.level>excluded.level THEN excluded.level ELSE pages.level END
+            """, (url, level))
+
+    def process_page(self, url, level, link_ttl):
+        # Fetch fresh even when link status is cached: the page's link graph may change.
+        if not self.allowed(url):
+            self.stats["robots"] += 1
+            p = urlsplit(url)
+            root = f"{p.scheme}://{p.netloc}"
+            return [], self.robots.get(root) is not None and p.netloc.lower() not in self.blocked_hosts
+        result, detail, html, final_url = self.fetch(url)
+        if result == "unknown":
+            self.stats["unknown"] += 1
+            LOG.warning("Página no comprobable %s: %s", url, detail)
+            return [], False  # Preserve the old graph and retry tomorrow.
+        self.db.execute("INSERT OR REPLACE INTO checks VALUES (?,?,?,?)", (url, now(), result, detail))
+        if result == "broken" or html is None:
+            return [], True
+        soup = BeautifulSoup(html, "html.parser")
+        # Honor <base href> for relative links.
+        base = urljoin(final_url, soup.base.get("href", "")) if soup.base else final_url
+        edges = set()
+        for tag in soup.find_all("a", href=True):
+            target = normalize(tag["href"], base)
+            if target:
+                anchor = " ".join(tag.get_text(" ", strip=True).split())[:500] or (tag.get("aria-label") or tag.get("title") or "")[:500]
+                edges.add((target, anchor))
+        self.db.execute("DELETE FROM links WHERE source=?", (url,))
+        self.db.executemany("INSERT OR IGNORE INTO links VALUES (?,?,?)", [(url, target, anchor) for target, anchor in edges])
+        for target, _ in edges:
+            self.enqueue(target, level + 1)
+        broken = []
+        incomplete = False
+        for target in sorted({t for t, _ in edges}):
+            if not self.allowed(target):
+                self.stats["robots"] += 1
+                if urlsplit(target).netloc.lower() in self.blocked_hosts:
+                    incomplete = True
+                continue
+            r, d, _ = self.check(target, link_ttl)
+            if r == "broken":
+                stamp = datetime.now(self.local_tz).isoformat(timespec="seconds")
+                broken.extend((level, stamp, url, target, anchor, d) for t, anchor in edges if t == target)
+            if r == "unknown":
+                incomplete = True
+        self.stats["pages"] += 1
+        self.stats["levels"].add((level, datetime.now(self.local_tz).date().isoformat()))
+        return broken, not incomplete
+
+    def record_page(self, url, round_number, complete, run_token):
+        retry = None if complete else (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        self.db.execute("""UPDATE pages SET checked_at=?,
+            completed_round=CASE WHEN ? THEN ? ELSE completed_round END,
+            retry_at=?, last_completed_execution=CASE WHEN ? THEN ? ELSE last_completed_execution END
+            WHERE url=?""", (now(), int(complete), round_number, retry,
+                             int(complete), run_token, url))
+
+
+def email_report(cfg, path, stats, findings):
+    if not cfg.getboolean("mail", "enabled"):
+        return
+    server = cfg.get("mail", "smtp_server_address")
+    protocol = cfg.get("mail", "smtp_protocol").lower()
+    if protocol not in ("ssl", "starttls"):
+        raise ValueError("smtp_protocol debe ser ssl o starttls")
+    port = cfg.getint("mail", "smtp_server_port", fallback=465 if protocol == "ssl" else 587)
+    user = os.environ.get(cfg.get("mail", "user_env", fallback="UPV_SMTP_USER"), "")
+    password = os.environ.get(cfg.get("mail", "password_env", fallback="UPV_SMTP_PASSWORD"), "")
+    if user and not password:
+        raise ValueError("Falta la contraseña SMTP en la variable de entorno configurada")
+    msg = EmailMessage()
+    sender = cfg.get("mail", "from_address", fallback="").strip() or user
+    if not sender:
+        raise ValueError("Falta from_address o el usuario SMTP en el entorno")
+    msg["From"] = sender
+    msg["To"] = cfg.get("mail", "recipients")
+    report_day = datetime.now(ZoneInfo(cfg.get("crawl", "report_timezone", fallback="Europe/Madrid"))).date()
+    msg["Subject"] = f"UPV: revisión de enlaces {report_day} ({len(findings)} incidencias)"
+    counts = {}
+    for level, stamp, *_ in findings:
+        key = (level, stamp[:10])
+        counts[key] = counts.get(key, 0) + 1
+    lines = ["Resumen de enlaces rotos", "Nivel | Día del rastreo | Número de enlaces rotos"]
+    for level, day in sorted(stats["levels"] | set(counts)):
+        lines.append(f"{level} | {day} | {counts.get((level, day), 0)}")
+    if not stats["levels"]:
+        lines.append("Sin páginas rastreadas en esta ejecución")
+    lines.extend(["", "Listado de enlaces rotos", "Fecha | Nivel | Página de origen | Enlace roto | Texto del enlace | Resultado"])
+    limit = cfg.getint("mail", "max_inline_rows", fallback=200)
+    for level, stamp, source, target, anchor, detail in sorted(findings)[:limit]:
+        lines.append(f"{stamp} | {level} | {source} | {target} | {anchor} | {detail}")
+    if len(findings) > limit:
+        lines.append(f"... {len(findings) - limit} filas adicionales en el CSV adjunto")
+    lines.extend(["", f"Páginas procesadas: {stats['pages']}", f"Solicitudes HTTP: {stats['checked']}",
+                  f"Comprobaciones inciertas: {stats['unknown']}", f"Exclusiones robots: {stats['robots']}",
+                  f"Respuestas de throttling: {stats['throttled']}", "Informe completo en el CSV adjunto."])
+    msg.set_content("\n".join(lines) + "\n")
+    msg.add_attachment(path.read_bytes(), maintype="text", subtype="csv", filename=path.name)
+    for attempt in range(3):
+        try:
+            conn = smtplib.SMTP_SSL(server, port, timeout=30) if protocol == "ssl" else smtplib.SMTP(server, port, timeout=30)
+            with conn as smtp:
+                if protocol == "starttls":
+                    smtp.ehlo()
+                    smtp.starttls()
+                    smtp.ehlo()
+                if user:
+                    smtp.login(user, password)
+                smtp.send_message(msg)
+            return
+        except (smtplib.SMTPException, OSError):
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--config", required=True)
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    cfg = configparser.ConfigParser(interpolation=None)
+    if not cfg.read(args.config):
+        ap.error("No se pudo leer la configuración")
+    db_path = Path(cfg.get("paths", "database")).expanduser()
+    report_dir = Path(cfg.get("paths", "reports")).expanduser()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    with open(str(db_path) + ".lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            LOG.info("Ya hay una ejecución activa; se omite")
+            return 0
+        with connect(db_path) as db:
+            auditor = Auditor(cfg, db)
+            root = normalize(cfg.get("crawl", "start_url"))
+            if root is None:
+                raise ValueError("start_url debe ser una URL HTTP(S) válida")
+            prune_old_data(db, auditor.retention_days, root)
+            auditor.enqueue(root, 0)
+            db.commit()
+            findings = set()
+            run_token = uuid.uuid4().hex
+            quota = cfg.getint("crawl", "max_pages_per_run")
+            attempted = 0
+            stopped = False
+            while attempted < quota and not stopped:
+                try:
+                    auditor.ensure_time()
+                except RunLimit:
+                    break
+                start_and_finish_rounds(db, auditor.level_schedule)
+                db.commit()
+                # Pages are unique within a level's round, across all cron invocations.
+                batch = list(db.execute(
+                    "SELECT p.url,p.level,r.round_number FROM pages p JOIN level_rounds r ON r.level=p.level "
+                    "WHERE r.active=1 AND p.completed_round<r.round_number "
+                    "AND (p.retry_at IS NULL OR p.retry_at<=?) "
+                    "ORDER BY p.level,(p.checked_at IS NOT NULL),p.url LIMIT ?",
+                    (now(), min(100, quota - attempted))))
+                if not batch:
+                    break
+                for url, level, round_number in batch:
+                    if attempted >= quota:
+                        break
+                    current = db.execute("SELECT level,completed_round,last_completed_execution FROM pages WHERE url=?", (url,)).fetchone()
+                    if current is None or current[0] != level or current[1] >= round_number:
+                        continue
+                    if current[2] == run_token:
+                        # Same page got a shorter path during this execution.
+                        # Reuse its stored link graph to reveal descendants.
+                        for (target,) in db.execute("SELECT DISTINCT target FROM links WHERE source=?", (url,)):
+                            auditor.enqueue(target, level + 1)
+                        auditor.record_page(url, round_number, True, run_token)
+                        db.commit()
+                        continue
+                    if urlsplit(url).netloc.lower() in auditor.blocked_hosts:
+                        auditor.record_page(url, round_number, False, run_token)
+                        db.commit()
+                        attempted += 1
+                        continue
+                    try:
+                        auditor.ensure_time()
+                        broken, complete = auditor.process_page(url, level, cfg.getfloat("crawl", "link_ttl_days"))
+                        findings.update(broken)
+                        auditor.record_page(url, round_number, complete, run_token)
+                        db.commit()
+                    except RunLimit:
+                        db.rollback()
+                        stopped = True
+                        break
+                    except Exception:
+                        db.rollback()
+                        LOG.exception("Error al procesar %s; se reintentará mañana", url)
+                        auditor.record_page(url, round_number, False, run_token)
+                        db.commit()
+                    attempted += 1
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            report = report_dir / f"enlaces_rotos_{stamp}.csv"
+            with report.open("w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(("fecha", "nivel", "pagina_origen", "enlace_roto", "texto_ancla", "resultado"))
+                for level, stamp, source, target, anchor, detail in sorted(findings):
+                    writer.writerow((stamp, level, source, target, anchor, detail))
+            LOG.info("%s páginas; %s solicitudes; %s respuestas 429/503; %s incidencias; informe: %s",
+                     auditor.stats["pages"], auditor.stats["checked"], auditor.stats["throttled"], len(findings), report)
+            email_report(cfg, report, auditor.stats, findings)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
