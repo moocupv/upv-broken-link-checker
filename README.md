@@ -4,21 +4,6 @@ La **portada es el nivel 0 y la única semilla**. Cada salto por un enlace HTTP(
 
 Cada ejecución revisa **hasta 10.000 páginas** por defecto, incluyendo las que descubra durante ese mismo lote, y entrega **un correo** con el CSV de incidencias vistas. El correo empieza con el resumen `Nivel | Día del rastreo | Número de enlaces rotos`, seguido del listado (primeras 200 filas por defecto; CSV completo adjunto). Un informe vacío solo indica que no se encontraron enlaces rotos en las páginas procesadas. Se comprueban los enlaces de las páginas de niveles 0 a 3, incluidos los que apuntan a nivel 4; las páginas de nivel 4 no se rastrean. Una página puede recibir una petición al comprobarla como enlace y otra al rastrearla; solo la segunda analiza sus enlaces. Los resultados válidos se reutilizan durante `link_ttl_days = 1`; los fallos inciertos se reintentan.
 
-## Preparar un repositorio GitHub
-
-El paquete ZIP incluye `smtp.env` **solo con valores ficticios de prueba**. `.gitignore` excluye ese archivo y cualquier `config.ini` local al ejecutar `git add .`; la plantilla publicable es `smtp.env.example`. Para subir el proyecto, descomprimir el ZIP, entrar en `upv-broken-links-checker`, crear un repositorio vacío en GitHub y ejecutar:
-
-```bash
-git init
-git add .
-git commit -m "Auditoría de enlaces UPV"
-git branch -M main
-git remote add origin https://github.com/USUARIO/REPOSITORIO.git
-git push -u origin main
-```
-
-Sustituir `USUARIO/REPOSITORIO` por el repositorio creado. Para usar el correo de verdad, crear `smtp.env` con las credenciales reales **en el servidor**; el de prueba incluido en el ZIP no puede autenticar.
-
 ## Instalación en Linux
 
 ```bash
