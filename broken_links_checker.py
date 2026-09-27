@@ -13,6 +13,7 @@ import sqlite3
 import sys
 import time
 import uuid
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
@@ -114,6 +115,11 @@ def connect(path):
             url TEXT PRIMARY KEY, checked_at TEXT NOT NULL,
             result TEXT NOT NULL, detail TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS pending_links (
+            url TEXT PRIMARY KEY, retry_at TEXT NOT NULL,
+            detail TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS pending_links_due ON pending_links(retry_at);
         CREATE INDEX IF NOT EXISTS pages_due ON pages(next_due, priority);
         CREATE INDEX IF NOT EXISTS links_target ON links(target);
         CREATE TABLE IF NOT EXISTS level_rounds (
@@ -128,6 +134,8 @@ def connect(path):
                               ("retry_at", "TEXT"), ("last_completed_execution", "TEXT")):
         if name not in columns:
             db.execute(f"ALTER TABLE pages ADD COLUMN {name} {declaration}")
+    if "context" not in {row[1] for row in db.execute("PRAGMA table_info(links)")}:
+        db.execute("ALTER TABLE links ADD COLUMN context TEXT NOT NULL DEFAULT 'sin_datos'")
     round_columns = {row[1] for row in db.execute("PRAGMA table_info(level_rounds)")}
     if "started_at" not in round_columns:
         db.execute("ALTER TABLE level_rounds ADD COLUMN started_at TEXT")
@@ -169,6 +177,38 @@ def prune_old_data(db, days, root):
         AND NOT EXISTS (SELECT 1 FROM level_rounds r WHERE r.level=pages.level
                         AND r.active=1)""", (root, cutoff))
     db.execute("DELETE FROM links WHERE source NOT IN (SELECT url FROM pages)")
+    db.execute("DELETE FROM pending_links WHERE NOT EXISTS (SELECT 1 FROM links WHERE target=pending_links.url)")
+
+
+def html_context(tag):
+    """Record DOM clues, without claiming computed visibility at any viewport."""
+    ancestors = [tag, *tag.parents]
+    names = {node.name for node in ancestors if getattr(node, "name", None)}
+    roles = {node.get("role", "").lower() for node in ancestors if getattr(node, "name", None)}
+    if "nav" in names or "navigation" in roles:
+        location = "navegacion"
+    elif "footer" in names:
+        location = "pie"
+    elif "header" in names:
+        location = "cabecera"
+    elif "aside" in names:
+        location = "lateral"
+    else:
+        location = "contenido"
+    flags = set()
+    for node in ancestors:
+        if not getattr(node, "name", None):
+            continue
+        tokens = " ".join([str(node.get("id", "")), *node.get("class", [])]).lower()
+        if re.search(r"(?:^|[\s_-])(?:mobile|movil|smartphone|hamburger)(?:$|[\s_-])", tokens):
+            flags.add("indicio_movil")
+        if node.has_attr("hidden") or node.has_attr("inert"):
+            flags.add("oculto_html")
+        if str(node.get("aria-hidden", "")).lower() == "true":
+            flags.add("aria_hidden")
+        if re.search(r"(?:display\s*:\s*none|visibility\s*:\s*hidden)", node.get("style", ""), re.I):
+            flags.add("oculto_inline")
+    return ";".join([location, *sorted(flags)])
 
 
 class Auditor:
@@ -352,6 +392,12 @@ class Auditor:
             self.db.execute("INSERT OR REPLACE INTO checks VALUES (?,?,?,?)", (url, now(), result, detail))
         return result, detail, html
 
+    def queue_uncertain_link(self, url, detail):
+        retry = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        self.db.execute("INSERT INTO pending_links(url,retry_at,detail) VALUES(?,?,?) "
+                        "ON CONFLICT(url) DO UPDATE SET detail=excluded.detail",
+                        (url, retry, detail))
+
     def enqueue(self, url, level):
         if level in self.level_schedule and crawlable(url) and (self.allow_private or public_host(url)):
             self.db.execute("""
@@ -380,33 +426,45 @@ class Auditor:
         soup = BeautifulSoup(html, "html.parser")
         # Honor <base href> for relative links.
         base = urljoin(final_url, soup.base.get("href", "")) if soup.base else final_url
-        edges = set()
+        edges = defaultdict(set)
         for tag in soup.find_all("a", href=True):
             target = normalize(tag["href"], base)
             if target:
-                anchor = " ".join(tag.get_text(" ", strip=True).split())[:500] or (tag.get("aria-label") or tag.get("title") or "")[:500]
-                edges.add((target, anchor))
+                anchor = (" ".join(tag.get_text(" ", strip=True).split())
+                          or tag.get("aria-label") or tag.get("title")
+                          or " ".join(img.get("alt", "") for img in tag.find_all("img"))).strip()[:500]
+                edges[(target, anchor)].update(html_context(tag).split(";"))
         self.db.execute("DELETE FROM links WHERE source=?", (url,))
-        self.db.executemany("INSERT OR IGNORE INTO links VALUES (?,?,?)", [(url, target, anchor) for target, anchor in edges])
+        self.db.executemany("INSERT OR IGNORE INTO links(source,target,anchor,context) VALUES (?,?,?,?)",
+                            [(url, target, anchor, ";".join(sorted(contexts)))
+                             for (target, anchor), contexts in edges.items()])
         for target, _ in edges:
             self.enqueue(target, level + 1)
         broken = []
-        incomplete = False
         for target in sorted({t for t, _ in edges}):
+            if not self.allow_private and not public_host(target):
+                continue
             if not self.allowed(target):
                 self.stats["robots"] += 1
-                if urlsplit(target).netloc.lower() in self.blocked_hosts:
-                    incomplete = True
+                p = urlsplit(target)
+                root = f"{p.scheme}://{p.netloc}"
+                if self.robots.get(root) is None:
+                    self.queue_uncertain_link(target, "robots.txt temporalmente no disponible")
                 continue
             r, d, _ = self.check(target, link_ttl)
             if r == "broken":
                 stamp = datetime.now(self.local_tz).isoformat(timespec="seconds")
-                broken.extend((level, stamp, url, target, anchor, d) for t, anchor in edges if t == target)
+                broken.extend((level, stamp, url, target, anchor, d, ";".join(sorted(contexts)))
+                              for (t, anchor), contexts in edges.items() if t == target)
             if r == "unknown":
-                incomplete = True
+                self.queue_uncertain_link(target, d)
+            else:
+                self.db.execute("DELETE FROM pending_links WHERE url=?", (target,))
         self.stats["pages"] += 1
         self.stats["levels"].add((level, datetime.now(self.local_tz).date().isoformat()))
-        return broken, not incomplete
+        # An uncertain outgoing link does not invalidate the page's HTML/graph.
+        # It has its own persistent retry queue instead.
+        return broken, True
 
     def record_page(self, url, round_number, complete, run_token):
         retry = None if complete else (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
@@ -417,7 +475,38 @@ class Auditor:
                              int(complete), run_token, url))
 
 
-def email_report(cfg, path, stats, findings):
+def group_findings(findings):
+    groups = {}
+    for level, stamp, source, target, anchor, detail, context in findings:
+        key = (target, detail)
+        if key not in groups:
+            groups[key] = {"target": target, "detail": detail, "rows": 0,
+                           "sources": set(), "anchors": set(), "contexts": set(),
+                           "levels": set(), "days": set(), "hosts": set()}
+        group = groups[key]
+        group["rows"] += 1
+        group["sources"].add(source)
+        group["anchors"].add(anchor or "(sin texto)")
+        group["contexts"].update(context.split(";"))
+        group["levels"].add(level)
+        group["days"].add(stamp[:10])
+        group["hosts"].add(urlsplit(source).hostname or "")
+    return sorted(groups.values(), key=lambda g: (-len(g["sources"]), -g["rows"], g["target"], g["detail"]))
+
+
+def write_grouped_report(path, groups):
+    with path.open("w", encoding="utf-8-sig", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(("enlace_roto", "resultado", "apariciones", "paginas_afectadas", "niveles",
+                         "dias_deteccion", "sitios_origen", "textos_ancla", "contextos_html", "pagina_ejemplo"))
+        for g in groups:
+            writer.writerow((g["target"], g["detail"], g["rows"], len(g["sources"]),
+                             ";".join(map(str, sorted(g["levels"]))), ";".join(sorted(g["days"])),
+                             ";".join(sorted(g["hosts"])), ";".join(sorted(g["anchors"])),
+                             ";".join(sorted(g["contexts"])), min(g["sources"])))
+
+
+def email_report(cfg, path, grouped_path, stats, findings, groups):
     if not cfg.getboolean("mail", "enabled"):
         return
     server = cfg.get("mail", "smtp_server_address")
@@ -436,26 +525,50 @@ def email_report(cfg, path, stats, findings):
     msg["From"] = sender
     msg["To"] = cfg.get("mail", "recipients")
     report_day = datetime.now(ZoneInfo(cfg.get("crawl", "report_timezone", fallback="Europe/Madrid"))).date()
-    msg["Subject"] = f"UPV: revisión de enlaces {report_day} ({len(findings)} incidencias)"
-    counts = {}
-    for level, stamp, *_ in findings:
+    msg["Subject"] = (f"UPV: revisión de enlaces {report_day} "
+                      f"({len({r[3] for r in findings})} destinos, {len(findings)} apariciones)")
+    counts = defaultdict(lambda: {"targets": set(), "sources": set(), "rows": 0})
+    for level, stamp, source, target, *_ in findings:
         key = (level, stamp[:10])
-        counts[key] = counts.get(key, 0) + 1
-    lines = ["Resumen de enlaces rotos", "Nivel | Día del rastreo | Número de enlaces rotos"]
+        counts[key]["targets"].add(target)
+        counts[key]["sources"].add(source)
+        counts[key]["rows"] += 1
+    lines = ["Resumen de enlaces rotos", "Nivel | Día | Destinos distintos | Apariciones | Páginas afectadas"]
     for level, day in sorted(stats["levels"] | set(counts)):
-        lines.append(f"{level} | {day} | {counts.get((level, day), 0)}")
+        c = counts[(level, day)]
+        lines.append(f"{level} | {day} | {len(c['targets'])} | {c['rows']} | {len(c['sources'])}")
     if not stats["levels"]:
         lines.append("Sin páginas rastreadas en esta ejecución")
-    lines.extend(["", "Listado de enlaces rotos", "Fecha | Nivel | Página de origen | Enlace roto | Texto del enlace | Resultado"])
-    limit = cfg.getint("mail", "max_inline_rows", fallback=200)
-    for level, stamp, source, target, anchor, detail in sorted(findings)[:limit]:
-        lines.append(f"{stamp} | {level} | {source} | {target} | {anchor} | {detail}")
-    if len(findings) > limit:
-        lines.append(f"... {len(findings) - limit} filas adicionales en el CSV adjunto")
+    lines.extend(["", f"Destinos distintos en la ejecución: {len({r[3] for r in findings})}",
+                  f"Apariciones: {len(findings)}", "",
+                  "Enlaces compartidos (agrupados por destino exacto y resultado)"])
+    limit = max(0, cfg.getint("mail", "max_inline_groups", fallback=30))
+    shared = [g for g in groups if len(g["sources"]) > 1]
+    isolated = [g for g in groups if len(g["sources"]) == 1]
+    isolated_budget = min(10, max(1, limit // 3), len(isolated)) if shared else limit
+    selected_shared = shared[:max(0, limit - isolated_budget)]
+    selected_isolated = isolated[:limit - len(selected_shared)]
+
+    def describe(g):
+        anchors = ", ".join(sorted(g["anchors"]))[:120]
+        contexts = ", ".join(sorted(g["contexts"]))
+        return (f"{g['detail']} | {len(g['sources'])} páginas | {g['rows']} apariciones | "
+                f"{g['target']}\n  Texto: {anchors}; contexto HTML: {contexts}; "
+                f"sitio: {', '.join(sorted(g['hosts']))}; ejemplo: {min(g['sources'])}")
+
+    lines.extend(describe(g) for g in selected_shared)
+    lines.extend(["", "Enlaces en una sola página (muestra)"])
+    lines.extend(describe(g) for g in selected_isolated)
+    if len(groups) > len(selected_shared) + len(selected_isolated):
+        lines.append(f"... {len(groups) - len(selected_shared) - len(selected_isolated)} grupos adicionales en el CSV agrupado")
     lines.extend(["", f"Páginas procesadas: {stats['pages']}", f"Solicitudes HTTP: {stats['checked']}",
                   f"Comprobaciones inciertas: {stats['unknown']}", f"Exclusiones robots: {stats['robots']}",
-                  f"Respuestas de throttling: {stats['throttled']}", "Informe completo en el CSV adjunto."])
+                  f"Respuestas de throttling: {stats['throttled']}",
+                  f"Enlaces pendientes de reintento: {stats['pending_links']}",
+                  "CSV agrupado y detalle completo adjuntos.",
+                  "El contexto HTML es una pista estructural; no prueba visibilidad en móvil."])
     msg.set_content("\n".join(lines) + "\n")
+    msg.add_attachment(grouped_path.read_bytes(), maintype="text", subtype="csv", filename=grouped_path.name)
     msg.add_attachment(path.read_bytes(), maintype="text", subtype="csv", filename=path.name)
     for attempt in range(3):
         try:
@@ -506,6 +619,41 @@ def main():
             quota = cfg.getint("crawl", "max_pages_per_run")
             attempted = 0
             stopped = False
+            # Check old uncertain links once per run without fetching their source
+            # pages again. Bound this work so page discovery cannot be starved.
+            pending_quota = cfg.getint("crawl", "max_pending_links_per_run", fallback=1000)
+            due_links = list(db.execute(
+                "SELECT url FROM pending_links WHERE retry_at<=? ORDER BY retry_at LIMIT ?",
+                (now(), pending_quota)))
+            retried = 0
+            for (target,) in due_links:
+                try:
+                    auditor.ensure_time()
+                    r, detail, _ = auditor.check(target, cfg.getfloat("crawl", "link_ttl_days"), force=True)
+                    if r == "unknown":
+                        root = f"{urlsplit(target).scheme}://{urlsplit(target).netloc}"
+                        if detail == "excluido por robots.txt" and auditor.robots.get(root) is not None:
+                            db.execute("DELETE FROM pending_links WHERE url=?", (target,))
+                        else:
+                            auditor.queue_uncertain_link(target, detail)
+                    else:
+                        db.execute("DELETE FROM pending_links WHERE url=?", (target,))
+                        if r == "broken":
+                            stamp = datetime.now(auditor.local_tz).isoformat(timespec="seconds")
+                            for source, anchor, context, level in db.execute(
+                                "SELECT l.source,l.anchor,l.context,p.level FROM links l JOIN pages p ON p.url=l.source "
+                                "WHERE l.target=? AND p.level IS NOT NULL", (target,)):
+                                if level in auditor.level_schedule:
+                                    findings.add((level, stamp, source, target, anchor, detail, context))
+                    db.commit()
+                    retried += 1
+                except RunLimit:
+                    db.rollback()
+                    stopped = True
+                    break
+            if due_links:
+                LOG.info("Reintentados %s enlaces pendientes; %s solicitudes HTTP hasta ahora",
+                         retried, auditor.stats["checked"])
             while attempted < quota and not stopped:
                 try:
                     auditor.ensure_time()
@@ -557,16 +705,24 @@ def main():
                         auditor.record_page(url, round_number, False, run_token)
                         db.commit()
                     attempted += 1
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            report = report_dir / f"enlaces_rotos_{stamp}.csv"
+                    if attempted % 100 == 0:
+                        LOG.info("Progreso: %s páginas intentadas, %s procesadas, %s solicitudes HTTP",
+                                 attempted, auditor.stats["pages"], auditor.stats["checked"])
+            auditor.stats["pending_links"] = db.execute("SELECT COUNT(*) FROM pending_links").fetchone()[0]
+            run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            report = report_dir / f"enlaces_rotos_{run_stamp}.csv"
             with report.open("w", encoding="utf-8-sig", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow(("fecha", "nivel", "pagina_origen", "enlace_roto", "texto_ancla", "resultado"))
-                for level, stamp, source, target, anchor, detail in sorted(findings):
-                    writer.writerow((stamp, level, source, target, anchor, detail))
-            LOG.info("%s páginas; %s solicitudes; %s respuestas 429/503; %s incidencias; informe: %s",
-                     auditor.stats["pages"], auditor.stats["checked"], auditor.stats["throttled"], len(findings), report)
-            email_report(cfg, report, auditor.stats, findings)
+                writer.writerow(("fecha", "nivel", "pagina_origen", "enlace_roto", "texto_ancla", "resultado", "contexto_html"))
+                for level, event_stamp, source, target, anchor, detail, context in sorted(findings):
+                    writer.writerow((event_stamp, level, source, target, anchor, detail, context))
+            groups = group_findings(findings)
+            grouped_report = report_dir / f"enlaces_rotos_{run_stamp}_agrupados.csv"
+            write_grouped_report(grouped_report, groups)
+            LOG.info("%s páginas; %s solicitudes; %s respuestas 429/503; %s enlaces pendientes; %s incidencias; informe: %s",
+                     auditor.stats["pages"], auditor.stats["checked"], auditor.stats["throttled"],
+                     auditor.stats["pending_links"], len(findings), report)
+            email_report(cfg, report, grouped_report, auditor.stats, findings, groups)
     return 0
 
 
