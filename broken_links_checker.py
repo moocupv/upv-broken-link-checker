@@ -65,6 +65,11 @@ def crawlable(url):
     return not NON_HTML.search(p.path)
 
 
+def upv_page(url):
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    return host == "upv.es" or host.endswith(".upv.es")
+
+
 def parse_level_schedule(value):
     """0:1;1:1;2:1;3:4 sets the minimum days between starts by depth."""
     result = {}
@@ -119,6 +124,10 @@ def connect(path):
             url TEXT PRIMARY KEY, retry_at TEXT NOT NULL,
             detail TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS context_backfill (
+            source TEXT PRIMARY KEY, attempted_at TEXT NOT NULL,
+            retry_at TEXT, result TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS pending_links_due ON pending_links(retry_at);
         CREATE INDEX IF NOT EXISTS pages_due ON pages(next_due, priority);
         CREATE INDEX IF NOT EXISTS links_target ON links(target);
@@ -147,6 +156,18 @@ def connect(path):
         db.execute("DELETE FROM level_rounds")
         db.execute("INSERT INTO schema_meta(key,value) VALUES('level_origin_home0','1')")
         db.commit()
+    if not db.execute("SELECT 1 FROM schema_meta WHERE key='upv_only_page_scope_v1'").fetchone():
+        # Keep external targets and their cached checks, but remove external
+        # source pages and their graphs from the old all-domain crawl.
+        external = [url for (url,) in db.execute("SELECT url FROM pages") if not upv_page(url)]
+        db.executemany("DELETE FROM links WHERE source=?", ((url,) for url in external))
+        db.executemany("DELETE FROM context_backfill WHERE source=?", ((url,) for url in external))
+        db.executemany("DELETE FROM pages WHERE url=?", ((url,) for url in external))
+        db.execute("DELETE FROM pending_links WHERE NOT EXISTS (SELECT 1 FROM links WHERE target=pending_links.url)")
+        db.execute("INSERT INTO schema_meta(key,value) VALUES('upv_only_page_scope_v1','1')")
+        db.commit()
+        if external:
+            LOG.info("Eliminadas %s páginas externas de la cola y sus enlaces salientes", len(external))
     return db
 
 
@@ -178,6 +199,7 @@ def prune_old_data(db, days, root):
                         AND r.active=1)""", (root, cutoff))
     db.execute("DELETE FROM links WHERE source NOT IN (SELECT url FROM pages)")
     db.execute("DELETE FROM pending_links WHERE NOT EXISTS (SELECT 1 FROM links WHERE target=pending_links.url)")
+    db.execute("DELETE FROM context_backfill WHERE source NOT IN (SELECT url FROM pages)")
 
 
 def html_context(tag):
@@ -209,6 +231,21 @@ def html_context(tag):
         if re.search(r"(?:display\s*:\s*none|visibility\s*:\s*hidden)", node.get("style", ""), re.I):
             flags.add("oculto_inline")
     return ";".join([location, *sorted(flags)])
+
+
+def extract_edges(html, final_url):
+    """Map (destination, text) to the DOM clues observed for that link."""
+    soup = BeautifulSoup(html, "html.parser")
+    base = urljoin(final_url, soup.base.get("href", "")) if soup.base else final_url
+    edges = defaultdict(set)
+    for tag in soup.find_all("a", href=True):
+        target = normalize(tag["href"], base)
+        if target:
+            anchor = (" ".join(tag.get_text(" ", strip=True).split())
+                      or tag.get("aria-label") or tag.get("title")
+                      or " ".join(img.get("alt", "") for img in tag.find_all("img"))).strip()[:500]
+            edges[(target, anchor)].update(html_context(tag).split(";"))
+    return edges
 
 
 class Auditor:
@@ -357,6 +394,10 @@ class Auditor:
                     return "broken", f"HTTP {status}", None, url
                 if status < 200:
                     return "unknown", f"HTTP {status}", None, url
+                if not upv_page(url):
+                    # External targets are checked by status, never downloaded
+                    # and parsed as pages (including UPV-to-external redirects).
+                    return "ok", f"HTTP {status}", None, url
                 mime = response.headers.get("Content-Type", "").lower()
                 # Mislabelled responses with no Content-Type can still be HTML.
                 is_html = "text/html" in mime or "application/xhtml+xml" in mime or (not mime and not NON_HTML.search(urlsplit(url).path))
@@ -399,7 +440,7 @@ class Auditor:
                         (url, retry, detail))
 
     def enqueue(self, url, level):
-        if level in self.level_schedule and crawlable(url) and (self.allow_private or public_host(url)):
+        if level in self.level_schedule and upv_page(url) and crawlable(url) and (self.allow_private or public_host(url)):
             self.db.execute("""
                 INSERT INTO pages(url,level) VALUES(?,?)
                 ON CONFLICT(url) DO UPDATE SET
@@ -423,17 +464,7 @@ class Auditor:
         self.db.execute("INSERT OR REPLACE INTO checks VALUES (?,?,?,?)", (url, now(), result, detail))
         if result == "broken" or html is None:
             return [], True
-        soup = BeautifulSoup(html, "html.parser")
-        # Honor <base href> for relative links.
-        base = urljoin(final_url, soup.base.get("href", "")) if soup.base else final_url
-        edges = defaultdict(set)
-        for tag in soup.find_all("a", href=True):
-            target = normalize(tag["href"], base)
-            if target:
-                anchor = (" ".join(tag.get_text(" ", strip=True).split())
-                          or tag.get("aria-label") or tag.get("title")
-                          or " ".join(img.get("alt", "") for img in tag.find_all("img"))).strip()[:500]
-                edges[(target, anchor)].update(html_context(tag).split(";"))
+        edges = extract_edges(html, final_url)
         self.db.execute("DELETE FROM links WHERE source=?", (url,))
         self.db.executemany("INSERT OR IGNORE INTO links(source,target,anchor,context) VALUES (?,?,?,?)",
                             [(url, target, anchor, ";".join(sorted(contexts)))
@@ -494,9 +525,16 @@ def group_findings(findings):
     return sorted(groups.values(), key=lambda g: (-len(g["sources"]), -g["rows"], g["target"], g["detail"]))
 
 
-def write_grouped_report(path, groups):
+def csv_delimiter(cfg):
+    format_name = cfg.get("report", "csv_format", fallback="es").strip().lower()
+    if format_name not in ("es", "en"):
+        raise ValueError("report.csv_format debe ser es (separador ;) o en (separador ,)")
+    return ";" if format_name == "es" else ","
+
+
+def write_grouped_report(path, groups, delimiter):
     with path.open("w", encoding="utf-8-sig", newline="") as file:
-        writer = csv.writer(file)
+        writer = csv.writer(file, delimiter=delimiter)
         writer.writerow(("enlace_roto", "resultado", "apariciones", "paginas_afectadas", "niveles",
                          "dias_deteccion", "sitios_origen", "textos_ancla", "contextos_html", "pagina_ejemplo"))
         for g in groups:
@@ -588,14 +626,101 @@ def email_report(cfg, path, grouped_path, stats, findings, groups):
             time.sleep(2 ** attempt)
 
 
+def run_context_backfill(cfg, db, auditor, report_dir):
+    """Fetch legacy pages once and update only link contexts, preserving rounds."""
+    quota = cfg.getint("crawl", "max_context_backfill_pages", fallback=1000)
+    if quota < 1:
+        raise ValueError("max_context_backfill_pages debe ser mayor que cero")
+    levels = sorted(auditor.level_schedule)
+    placeholders = ",".join("?" for _ in levels)
+    candidates = list(db.execute(f"""
+        SELECT p.url,p.level FROM pages p
+        WHERE p.level IN ({placeholders})
+          AND EXISTS (SELECT 1 FROM links l WHERE l.source=p.url AND l.context='sin_datos')
+          AND NOT EXISTS (SELECT 1 FROM context_backfill b WHERE b.source=p.url
+                          AND (b.retry_at IS NULL OR b.retry_at>?))
+        ORDER BY p.level,p.url LIMIT ?
+    """, (*levels, now(), quota)))
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    report = report_dir / f"contexto_pendiente_{stamp}.csv"
+    processed = updated = 0
+    with report.open("w", encoding="utf-8-sig", newline="") as file:
+        writer = csv.writer(file, delimiter=csv_delimiter(cfg))
+        writer.writerow(("pagina_origen", "nivel", "resultado", "enlaces_con_contexto", "enlaces_antiguos", "detalle"))
+        for url, level in candidates:
+            try:
+                auditor.ensure_time()
+                old = list(db.execute("SELECT target,anchor FROM links WHERE source=? AND context='sin_datos'", (url,)))
+                if not old:
+                    continue
+                retry_at = None
+                matched = 0
+                detail = ""
+                if not auditor.allowed(url):
+                    p = urlsplit(url)
+                    root = f"{p.scheme}://{p.netloc}"
+                    if auditor.robots.get(root) is None:
+                        result, detail = "reintentar", "robots.txt no disponible"
+                    else:
+                        result, detail = "excluida", "excluida por robots.txt"
+                else:
+                    status, detail, html, final_url = auditor.fetch(url)
+                    if status == "unknown":
+                        result = "reintentar"
+                    elif html is None:
+                        result = "sin_html"
+                    else:
+                        edges = extract_edges(html, final_url)
+                        for target, anchor in old:
+                            context = edges.get((target, anchor))
+                            if context:
+                                db.execute("UPDATE links SET context=? WHERE source=? AND target=? AND anchor=?",
+                                           (";".join(sorted(context)), url, target, anchor))
+                                matched += 1
+                        result = "actualizada" if matched else "sin_coincidencias"
+                        updated += matched
+                if result == "reintentar":
+                    retry_at = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+                db.execute("""INSERT INTO context_backfill(source,attempted_at,retry_at,result) VALUES(?,?,?,?)
+                    ON CONFLICT(source) DO UPDATE SET attempted_at=excluded.attempted_at,
+                    retry_at=excluded.retry_at,result=excluded.result""", (url, now(), retry_at, result))
+                db.commit()
+                writer.writerow((url, level, result, matched, len(old), detail))
+                processed += 1
+                if processed % 100 == 0:
+                    LOG.info("Contexto: %s páginas intentadas, %s enlaces actualizados, %s solicitudes HTTP",
+                             processed, updated, auditor.stats["checked"])
+            except RunLimit:
+                db.rollback()
+                break
+            except Exception as exc:
+                db.rollback()
+                LOG.exception("Error al actualizar contexto de %s", url)
+                retry_at = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+                db.execute("""INSERT INTO context_backfill(source,attempted_at,retry_at,result) VALUES(?,?,?,'reintentar')
+                    ON CONFLICT(source) DO UPDATE SET attempted_at=excluded.attempted_at,
+                    retry_at=excluded.retry_at,result=excluded.result""", (url, now(), retry_at))
+                db.commit()
+                writer.writerow((url, level, "reintentar", 0, len(old), f"{type(exc).__name__}: {str(exc)[:180]}"))
+                processed += 1
+    remaining = db.execute("SELECT COUNT(DISTINCT source) FROM links WHERE context='sin_datos'").fetchone()[0]
+    LOG.info("Contexto: %s páginas intentadas, %s enlaces actualizados, %s solicitudes HTTP; "
+             "%s páginas aún contienen contexto antiguo (incluidas excluidas/sin coincidencias); informe: %s",
+             processed, updated, auditor.stats["checked"], remaining, report)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--config", required=True)
+    ap.add_argument("--backfill-context", action="store_true",
+                    help="Actualizar solo el contexto HTML de enlaces antiguos, sin revisar sus destinos")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = configparser.ConfigParser(interpolation=None)
     if not cfg.read(args.config):
         ap.error("No se pudo leer la configuración")
+    delimiter = csv_delimiter(cfg)
     db_path = Path(cfg.get("paths", "database")).expanduser()
     report_dir = Path(cfg.get("paths", "reports")).expanduser()
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -605,12 +730,14 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             LOG.info("Ya hay una ejecución activa; se omite")
-            return 0
+            return 2 if args.backfill_context else 0
         with connect(db_path) as db:
             auditor = Auditor(cfg, db)
+            if args.backfill_context:
+                return run_context_backfill(cfg, db, auditor, report_dir)
             root = normalize(cfg.get("crawl", "start_url"))
-            if root is None:
-                raise ValueError("start_url debe ser una URL HTTP(S) válida")
+            if root is None or not upv_page(root):
+                raise ValueError("start_url debe ser una URL HTTP(S) de upv.es o uno de sus subdominios")
             prune_old_data(db, auditor.retention_days, root)
             auditor.enqueue(root, 0)
             db.commit()
@@ -712,13 +839,13 @@ def main():
             run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             report = report_dir / f"enlaces_rotos_{run_stamp}.csv"
             with report.open("w", encoding="utf-8-sig", newline="") as f:
-                writer = csv.writer(f)
+                writer = csv.writer(f, delimiter=delimiter)
                 writer.writerow(("fecha", "nivel", "pagina_origen", "enlace_roto", "texto_ancla", "resultado", "contexto_html"))
                 for level, event_stamp, source, target, anchor, detail, context in sorted(findings):
                     writer.writerow((event_stamp, level, source, target, anchor, detail, context))
             groups = group_findings(findings)
             grouped_report = report_dir / f"enlaces_rotos_{run_stamp}_agrupados.csv"
-            write_grouped_report(grouped_report, groups)
+            write_grouped_report(grouped_report, groups, delimiter)
             LOG.info("%s páginas; %s solicitudes; %s respuestas 429/503; %s enlaces pendientes; %s incidencias; informe: %s",
                      auditor.stats["pages"], auditor.stats["checked"], auditor.stats["throttled"],
                      auditor.stats["pending_links"], len(findings), report)

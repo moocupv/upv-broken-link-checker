@@ -33,3 +33,16 @@ Para actualizar el programa, descarga la nueva versión y repite `sudo bash inst
 Deja que termine el proceso en curso antes de actualizar el fichero Python; compruébalo con `pgrep -af '[b]roken_links_checker.py'`. Si instalaste clonando GitHub, entra en `/opt/broken_links_checker` y ejecuta `git pull --ff-only` con el usuario que administra ese clon. No borres ni muevas `state.sqlite3`, sus ficheros `-wal` y `-shm`, `config.ini` o `smtp.env`. El siguiente arranque crea automáticamente la tabla `pending_links`; conserva los niveles y las rondas anteriores. Las páginas que ya tenían `retry_at` por un enlace incierto se leerán una última vez al vencer ese plazo y desde entonces el enlace se reintentará de forma independiente. Si quieres un límite distinto al predeterminado, añade `max_pending_links_per_run = 1000` bajo `[crawl]` en `config.ini`. La versión nueva escribe una línea de progreso cada 100 páginas intentadas.
 
 El siguiente arranque también añade la columna `context` a la tabla `links` existente sin borrar el grafo. Los enlaces guardados antes de la actualización muestran `sin_datos` hasta que se vuelva a rastrear su página. Para cambiar las 30 agrupaciones mostradas en el correo, añade `max_inline_groups = 30` bajo `[mail]` en tu `config.ini`; el `max_inline_rows` anterior deja de utilizarse. Se adjuntan el CSV agrupado y el CSV completo con `contexto_html`.
+
+Para completar antes los contextos antiguos, espera a que `pgrep -af '[b]roken_links_checker.py'` no muestre ningún proceso y ejecuta como `analytics-svc`:
+
+```bash
+cd /opt/broken_links_checker
+nohup venv/bin/python broken_links_checker.py --config config.ini --backfill-context >> reports/backfill.log 2>&1 < /dev/null &
+```
+
+No necesita `smtp.env`: no envía correo. El estado se conserva para poder repetir la orden cuando haya más de `max_context_backfill_pages = 1000` páginas o fallos temporales. Consulta el resultado en `reports/backfill.log` y `reports/contexto_pendiente_*.csv`. No lo incluyas en cron.
+
+Para elegir el separador de todos los CSV, añade a `config.ini` la sección `[report]` con `csv_format = es` (`;`) o `csv_format = en` (`,`). Si falta, se usa `es` por defecto. No hace falta modificar las credenciales ni la base SQLite.
+
+Tras actualizar a la versión que solo rastrea páginas UPV, el siguiente arranque elimina del grafo antiguo las páginas de otros dominios y sus enlaces salientes. Conserva los enlaces que parten de páginas UPV hacia sitios externos y los sigue comprobando por estado HTTP. Espera a que termine el proceso actual antes de hacer `git pull` y lanzar la versión nueva; no borres `state.sqlite3`.
