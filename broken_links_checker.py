@@ -632,7 +632,10 @@ def email_report(cfg, path, grouped_path, stats, findings, groups, recipients=No
         counts[key]["sources"].add(source)
         counts[key]["rows"] += 1
     lines = ([f"Ámbito: {scope}"] if scope else []) + [
-        "Resumen de enlaces rotos", "Nivel | Día | Destinos distintos | Apariciones | Páginas afectadas"]
+        "Resumen de enlaces rotos",
+        f"Fin de esta ejecución: {stats.get('finish_reason', 'No registrado')}",
+        f"Páginas intentadas en total: {stats.get('attempted_pages', 0)}",
+        "Nivel | Día | Destinos distintos | Apariciones | Páginas afectadas"]
     for level, day in sorted(stats["levels"] | set(counts)):
         c = counts[(level, day)]
         lines.append(f"{level} | {day} | {len(c['targets'])} | {c['rows']} | {len(c['sources'])}")
@@ -868,6 +871,7 @@ def main():
             quota = cfg.getint("crawl", "max_pages_per_run")
             attempted = 0
             stopped = False
+            finish_reason = None
             # Check old uncertain links once per run without fetching their source
             # pages again. Bound this work so page discovery cannot be starved.
             pending_quota = cfg.getint("crawl", "max_pending_links_per_run", fallback=1000)
@@ -896,9 +900,10 @@ def main():
                                     findings.add((level, stamp, source, target, anchor, detail, context))
                     db.commit()
                     retried += 1
-                except RunLimit:
+                except RunLimit as exc:
                     db.rollback()
                     stopped = True
+                    finish_reason = str(exc)
                     break
             if due_links:
                 LOG.info("Reintentados %s enlaces pendientes; %s solicitudes HTTP hasta ahora",
@@ -906,7 +911,8 @@ def main():
             while attempted < quota and not stopped:
                 try:
                     auditor.ensure_time()
-                except RunLimit:
+                except RunLimit as exc:
+                    finish_reason = str(exc)
                     break
                 start_and_finish_rounds(db, auditor.level_schedule)
                 db.commit()
@@ -918,6 +924,7 @@ def main():
                     "ORDER BY p.level,(p.checked_at IS NOT NULL),p.url LIMIT ?",
                     (now(), min(100, quota - attempted))))
                 if not batch:
+                    finish_reason = "No hay páginas listas para revisar ahora"
                     break
                 for url, level, round_number in batch:
                     if attempted >= quota:
@@ -944,9 +951,10 @@ def main():
                         findings.update(broken)
                         auditor.record_page(url, round_number, complete, run_token)
                         db.commit()
-                    except RunLimit:
+                    except RunLimit as exc:
                         db.rollback()
                         stopped = True
+                        finish_reason = str(exc)
                         break
                     except Exception:
                         db.rollback()
@@ -957,6 +965,10 @@ def main():
                     if attempted % 100 == 0:
                         LOG.info("Progreso: %s páginas intentadas, %s procesadas, %s solicitudes HTTP",
                                  attempted, auditor.stats["pages"], auditor.stats["checked"])
+            if finish_reason is None:
+                finish_reason = f"Límite de páginas intentadas alcanzado ({quota})"
+            auditor.stats["finish_reason"] = finish_reason
+            auditor.stats["attempted_pages"] = attempted
             auditor.stats["pending_links"] = db.execute("SELECT COUNT(*) FROM pending_links").fetchone()[0]
             run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             report = report_dir / f"enlaces_rotos_{run_stamp}.csv"
@@ -964,7 +976,8 @@ def main():
             groups = group_findings(findings)
             grouped_report = report_dir / f"enlaces_rotos_{run_stamp}_agrupados.csv"
             write_grouped_report(grouped_report, groups, delimiter)
-            LOG.info("%s páginas; %s solicitudes; %s respuestas 429/503; %s enlaces pendientes; %s incidencias; informe: %s",
+            LOG.info("Fin: %s; %s páginas intentadas, %s procesadas; %s solicitudes; %s respuestas 429/503; %s enlaces pendientes; %s incidencias; informe: %s",
+                     finish_reason, attempted,
                      auditor.stats["pages"], auditor.stats["checked"], auditor.stats["throttled"],
                      auditor.stats["pending_links"], len(findings), report)
             send_partitioned_reports(cfg, report_dir, run_stamp, delimiter, findings, auditor.stats, routes)

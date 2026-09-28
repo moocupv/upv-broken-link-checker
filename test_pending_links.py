@@ -1,7 +1,9 @@
 """Regression tests for persistent link retries, with no network or SMTP."""
 import configparser
 import csv
+import fcntl
 import sqlite3
+import smtplib
 import sys
 import tempfile
 import unittest
@@ -168,6 +170,194 @@ class PendingLinksTest(unittest.TestCase):
                 self.assertEqual(db.execute("SELECT result FROM checks").fetchone()[0], "broken")
                 self.assertEqual(db.execute("SELECT url FROM pending_links").fetchone()[0],
                                  "https://apps.apple.com/oferta")
+
+    def test_subdomain_routing_uses_source_and_filters_attachments(self):
+        cfg = configparser.ConfigParser(interpolation=None)
+        cfg.read(Path(__file__).with_name("config.ini.example"))
+        cfg.set("mail", "subdominios", "alumni.upv.es:equipo@example.org, "
+                "cfp.upv.es:equipo@example.org, etsit.upv.es:etsit@example.org")
+        routes = checker.subdomain_routes(cfg)
+        self.assertEqual(checker.recipient_for_source("https://x.alumni.upv.es/a", routes), "equipo@example.org")
+        self.assertIsNone(checker.recipient_for_source("https://www.upv.es/a", routes))
+        day = "2026-09-28T12:00:00+02:00"
+        target = "https://apps.apple.com/oferta"
+        findings = {(1, day, source, target, "Apple", "HTTP 404", "navegacion") for source in (
+            "https://alumni.upv.es/a", "https://cfp.upv.es/b", "https://www.upv.es/c")}
+        findings.add((1, day, "https://etsit.upv.es/d", "https://example.com/bad", "Otro", "HTTP 404", "pie"))
+        stats = {"source_levels": {(1, day[:10], f[2]) for f in findings}, "levels": {(1, day[:10])},
+                 "pages": 4, "checked": 20, "unknown": 0, "robots": 0, "throttled": 0, "pending_links": 0}
+        captured = []
+
+        def capture(cfg, detail, grouped, segment_stats, subset, groups, recipients=None, scope=None):
+            with detail.open(encoding="utf-8-sig", newline="") as file:
+                rows = list(csv.DictReader(file, delimiter=";"))
+            with grouped.open(encoding="utf-8-sig", newline="") as file:
+                summaries = list(csv.DictReader(file, delimiter=";"))
+            captured.append((recipients, scope, segment_stats["pages"], rows, summaries))
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(checker, "email_report", side_effect=capture):
+            checker.send_partitioned_reports(cfg, Path(temp), "run", ";", findings, stats, routes)
+        self.assertEqual(len(captured), 3)
+        primary, combined, etsit = captured
+        self.assertIsNone(primary[0])
+        self.assertEqual([r["pagina_origen"] for r in primary[3]], ["https://www.upv.es/c"])
+        self.assertEqual(combined[0], "equipo@example.org")
+        self.assertEqual(combined[2], 2)
+        self.assertEqual({r["pagina_origen"] for r in combined[3]},
+                         {"https://alumni.upv.es/a", "https://cfp.upv.es/b"})
+        self.assertEqual(combined[4][0]["paginas_afectadas"], "2")
+        self.assertEqual(etsit[0], "etsit@example.org")
+        self.assertEqual([r["pagina_origen"] for r in etsit[3]], ["https://etsit.upv.es/d"])
+
+    def test_route_validation_and_specificity(self):
+        cfg = configparser.ConfigParser()
+        cfg.add_section("mail")
+        cfg.set("mail", "subdominios", "alumni.upv.es:general@example.org, "
+                "club.alumni.upv.es:club@example.org")
+        self.assertEqual(checker.recipient_for_source("https://club.alumni.upv.es/", checker.subdomain_routes(cfg)),
+                         "club@example.org")
+        for bad in ("upv.es:a@example.org", "upv.es.evil.org:a@example.org", "alumni.upv.es:not-an-email",
+                    "alumni.upv.es:a@example.org, alumni.upv.es:b@example.org"):
+            cfg.set("mail", "subdominios", bad)
+            with self.assertRaises(ValueError):
+                checker.subdomain_routes(cfg)
+
+    def test_execution_finish_reasons(self):
+        for option, value, expected in ((None, None, "Límite de páginas intentadas alcanzado (1)"),
+                                        ("max_http_requests_per_run", "0", "Límite de solicitudes HTTP alcanzado"),
+                                        ("max_duration_hours", "0", "Tiempo máximo de ejecución alcanzado")):
+            with self.subTest(option=option), tempfile.TemporaryDirectory() as temp:
+                base = Path(temp)
+                cfg = configparser.ConfigParser(interpolation=None)
+                cfg.read(Path(__file__).with_name("config.ini.example"))
+                cfg.set("paths", "database", str(base / "state.sqlite3"))
+                cfg.set("paths", "reports", str(base / "reports"))
+                cfg.set("crawl", "level_schedule", "0:1")
+                cfg.set("crawl", "max_pages_per_run", "1")
+                if option:
+                    cfg.set("crawl", option, value)
+                with (base / "config.ini").open("w") as file:
+                    cfg.write(file)
+                captured = []
+
+                def run():
+                    with patch.object(sys, "argv", ["checker", "--config", str(base / "config.ini")]), \
+                         patch.object(checker.Auditor, "allowed", return_value=True), \
+                         patch.object(checker.Auditor, "fetch", return_value=(
+                             "ok", "HTTP 200", "", "https://www.upv.es/")), \
+                         patch.object(checker, "send_partitioned_reports", side_effect=lambda *args: captured.append(args[5].copy())):
+                        checker.main()
+
+                run()
+                self.assertEqual(captured[-1]["finish_reason"], expected)
+                self.assertEqual(captured[-1]["attempted_pages"], 1 if option is None else 0)
+                if option is None:
+                    run()
+                    self.assertEqual(captured[-1]["finish_reason"], "No hay páginas listas para revisar ahora")
+                    self.assertEqual(captured[-1]["attempted_pages"], 0)
+
+    def test_email_says_why_the_execution_ended(self):
+        cfg = configparser.ConfigParser(interpolation=None)
+        cfg.read(Path(__file__).with_name("config.ini.example"))
+        cfg.set("mail", "enabled", "yes")
+        cfg.set("mail", "smtp_protocol", "ssl")
+        cfg.set("mail", "from_address", "checker@example.org")
+        cfg.set("mail", "user_env", "UNSET_TEST_UPV_SMTP_USERNAME")
+        cfg.set("mail", "password_env", "UNSET_TEST_UPV_SMTP_PASSWORD")
+        messages = []
+
+        class SMTP:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def send_message(self, msg):
+                messages.append(msg)
+
+        stats = {"levels": set(), "pages": 0, "checked": 50, "unknown": 0, "robots": 0,
+                 "throttled": 0, "pending_links": 0, "attempted_pages": 4,
+                 "finish_reason": "Límite de solicitudes HTTP alcanzado"}
+        with tempfile.TemporaryDirectory() as temp, patch.object(checker.smtplib, "SMTP_SSL", return_value=SMTP()):
+            detail = Path(temp) / "detail.csv"
+            grouped = Path(temp) / "grouped.csv"
+            detail.write_text("detalle\n")
+            grouped.write_text("grupos\n")
+            checker.email_report(cfg, detail, grouped, stats, set(), [], scope="Resto UPV")
+        body = messages[0].get_body(preferencelist=("plain",)).get_content()
+        self.assertIn("Fin de esta ejecución: Límite de solicitudes HTTP alcanzado", body)
+        self.assertIn("Páginas intentadas en total: 4", body)
+
+    def test_a_failed_delivery_does_not_skip_other_subdomain_reports(self):
+        cfg = configparser.ConfigParser(interpolation=None)
+        cfg.read(Path(__file__).with_name("config.ini.example"))
+        routes = [("alumni.upv.es", "alumni@example.org"), ("cfp.upv.es", "cfp@example.org")]
+        day = "2026-09-28"
+        findings = {(1, day, f"https://{domain}/", f"https://example.org/{domain}",
+                     "Enlace", "HTTP 404", "contenido") for domain, _ in routes}
+        stats = {"source_levels": {(f[0], day, f[2]) for f in findings}, "levels": {(1, day)},
+                 "pages": 2, "checked": 2, "unknown": 0, "robots": 0, "throttled": 0, "pending_links": 0}
+        delivered = []
+
+        def send(*args, recipients=None, scope=None):
+            delivered.append(recipients)
+            if recipients == "alumni@example.org":
+                raise smtplib.SMTPException("fallo simulado")
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(checker, "email_report", side_effect=send):
+            with self.assertRaisesRegex(RuntimeError, "alumni.upv.es"):
+                checker.send_partitioned_reports(cfg, Path(temp), "run", ";", findings, stats, routes)
+        self.assertEqual(delivered, [None, "alumni@example.org", "cfp@example.org"])
+
+    def test_alternate_root_keeps_its_own_graph_and_shares_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            cfg = configparser.ConfigParser(interpolation=None)
+            cfg.read(Path(__file__).with_name("config.ini.example"))
+            cfg.set("paths", "database", str(base / "state.sqlite3"))
+            cfg.set("paths", "reports", str(base / "reports"))
+            cfg.set("crawl", "level_schedule", "0:1;1:1")
+            cfg.set("crawl", "max_pages_per_run", "2")
+            config_path = base / "config.ini"
+            with config_path.open("w") as file:
+                cfg.write(file)
+
+            def fetch(auditor, url):
+                html = ('<a href="https://dept.upv.es/info">Otro subdominio</a>'
+                        '<a href="https://example.org/out">Externo</a>') if url == "https://etsit.upv.es/" else ""
+                return "ok", "HTTP 200", html, url
+
+            with patch.object(checker.Auditor, "allowed", return_value=True), \
+                 patch.object(checker.Auditor, "fetch", autospec=True, side_effect=fetch), \
+                 patch.object(checker.Auditor, "check", return_value=("ok", "HTTP 200", None)):
+                with patch.object(sys, "argv", ["checker", "--config", str(config_path)]):
+                    self.assertEqual(checker.main(), 0)
+                args = ["checker", "--config", str(config_path), "--start-url", "https://etsit.upv.es/"]
+                # A running home crawl also blocks a crawl with a different root.
+                with (base / "state.sqlite3.lock").open("w") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with patch.object(sys, "argv", args):
+                        self.assertEqual(checker.main(), 0)
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                with patch.object(sys, "argv", args):
+                    self.assertEqual(checker.main(), 0)
+
+            other_db = next(base.glob("state-etsit_upv_es-*.sqlite3"))
+            with sqlite3.connect(base / "state.sqlite3") as db:
+                self.assertEqual(db.execute("SELECT url FROM pages WHERE level=0").fetchone()[0],
+                                 "https://www.upv.es/")
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM pages").fetchone()[0], 1)
+                with self.assertRaises(ValueError):
+                    checker.bind_root(db, "https://etsit.upv.es/")
+            with sqlite3.connect(other_db) as db:
+                self.assertEqual(db.execute("SELECT url FROM pages WHERE level=0").fetchone()[0],
+                                 "https://etsit.upv.es/")
+                self.assertEqual(db.execute("SELECT url FROM pages WHERE level=1").fetchone()[0],
+                                 "https://dept.upv.es/info")
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM pages").fetchone()[0], 2)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM links WHERE target='https://example.org/out'").fetchone()[0], 1)
+            self.assertTrue(list((base / "reports").glob("etsit_upv_es-*/*.csv")))
 
     def test_upgrade_preserves_existing_links(self):
         with tempfile.TemporaryDirectory() as temp:
