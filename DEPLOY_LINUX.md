@@ -46,3 +46,15 @@ No necesita `smtp.env`: no envía correo. El estado se conserva para poder repet
 Para elegir el separador de todos los CSV, añade a `config.ini` la sección `[report]` con `csv_format = es` (`;`) o `csv_format = en` (`,`). Si falta, se usa `es` por defecto. No hace falta modificar las credenciales ni la base SQLite.
 
 Tras actualizar a la versión que solo rastrea páginas UPV, el siguiente arranque elimina del grafo antiguo las páginas de otros dominios y sus enlaces salientes. Conserva los enlaces que parten de páginas UPV hacia sitios externos y los sigue comprobando por estado HTTP. Espera a que termine el proceso actual antes de hacer `git pull` y lanzar la versión nueva; no borres `state.sqlite3`.
+
+Para enviar informes específicos, añade bajo `[mail]` de `config.ini` una línea como `subdominios = alumni.upv.es:alumni@example.org, cfp.upv.es:cfp@example.org`. Sustituye las direcciones por destinatarios reales. El informe de las demás páginas sigue llegando a `recipients`; la selección se hace por el host de la página de origen. Si no hay rutas, se conserva un solo correo. La línea se valida al arrancar.
+
+Para probar otra raíz sin tocar la base principal, cuando no haya un rastreo activo ejecuta:
+
+```bash
+cd /opt/broken_links_checker
+. ./smtp.env
+venv/bin/python broken_links_checker.py --config config.ini --start-url https://etsit.upv.es/
+```
+
+El comando crea su propio fichero SQLite e informes bajo `reports/`, y comparte el bloqueo con el rastreo principal: si hay una ejecución activa, se omite y debes volver a lanzarlo cuando termine. Conserva las restricciones y los destinatarios del `config.ini`. La opción no queda programada en cron a menos que añadas una entrada específica. Si cambias la raíz en el INI sin usar la opción, define otra ruta `paths.database` y `paths.reports` para evitar mezclar las distancias de dos raíces.

@@ -53,5 +53,9 @@ password_env = UPV_SMTP_PASSWORD
 ; Optional; when empty, use UPV_SMTP_USER as sender.
 from_address =
 recipients = webmaster@example.org
+; Optional source-subdomain routing. Matching includes each host's child subdomains.
+; Multiple entries may share one recipient and will be combined in one email.
+subdominios =
+;   alumni.upv.es:alumni@example.org, cfp.upv.es:cfp@example.org
 ; Total number of destination groups shown inline (shared plus up to 10 isolated).
 max_inline_groups = 30

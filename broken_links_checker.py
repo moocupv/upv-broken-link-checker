@@ -4,6 +4,7 @@ import argparse
 import configparser
 import csv
 import fcntl
+import hashlib
 import ipaddress
 import logging
 import os
@@ -171,6 +172,20 @@ def connect(path):
     return db
 
 
+def bind_root(db, root):
+    """Never reuse a level graph whose distances came from another root."""
+    row = db.execute("SELECT value FROM schema_meta WHERE key='crawl_root'").fetchone()
+    if row:
+        if row[0] != root:
+            raise ValueError(f"La base pertenece a {row[0]}; usa --start-url para crear un estado independiente")
+        return
+    old_root = db.execute("SELECT url FROM pages WHERE level=0 LIMIT 1").fetchone()
+    if old_root and old_root[0] != root:
+        raise ValueError(f"La base existente parte de {old_root[0]}; usa --start-url para crear un estado independiente")
+    db.execute("INSERT INTO schema_meta(key,value) VALUES('crawl_root',?)", (root,))
+    db.commit()
+
+
 def start_and_finish_rounds(db, schedule):
     """Complete exhausted rounds and start due rounds, including freshly discovered levels."""
     for level, days in schedule.items():
@@ -273,7 +288,8 @@ class Auditor:
         self.max_retry_wait = cfg.getfloat("crawl", "max_retry_wait_seconds", fallback=30.)
         self.deadline = time.monotonic() + cfg.getfloat("crawl", "max_duration_hours", fallback=20.) * 3600
         self.request_limit = cfg.getint("crawl", "max_http_requests_per_run", fallback=50000)
-        self.stats = {"pages": 0, "checked": 0, "unknown": 0, "robots": 0, "throttled": 0, "levels": set()}
+        self.stats = {"pages": 0, "checked": 0, "unknown": 0, "robots": 0, "throttled": 0,
+                      "levels": set(), "source_levels": set()}
 
     def ensure_time(self):
         if time.monotonic() >= self.deadline:
@@ -463,6 +479,10 @@ class Auditor:
             return [], False  # Preserve the old graph and retry tomorrow.
         self.db.execute("INSERT OR REPLACE INTO checks VALUES (?,?,?,?)", (url, now(), result, detail))
         if result == "broken" or html is None:
+            self.stats["pages"] += 1
+            day = datetime.now(self.local_tz).date().isoformat()
+            self.stats["levels"].add((level, day))
+            self.stats["source_levels"].add((level, day, url))
             return [], True
         edges = extract_edges(html, final_url)
         self.db.execute("DELETE FROM links WHERE source=?", (url,))
@@ -492,7 +512,9 @@ class Auditor:
             else:
                 self.db.execute("DELETE FROM pending_links WHERE url=?", (target,))
         self.stats["pages"] += 1
-        self.stats["levels"].add((level, datetime.now(self.local_tz).date().isoformat()))
+        day = datetime.now(self.local_tz).date().isoformat()
+        self.stats["levels"].add((level, day))
+        self.stats["source_levels"].add((level, day, url))
         # An uncertain outgoing link does not invalidate the page's HTML/graph.
         # It has its own persistent retry queue instead.
         return broken, True
@@ -532,6 +554,44 @@ def csv_delimiter(cfg):
     return ";" if format_name == "es" else ","
 
 
+def subdomain_routes(cfg):
+    """Return (host, recipient) pairs, most specific first."""
+    routes = {}
+    raw = cfg.get("mail", "subdominios", fallback="")
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ":" not in entry:
+            raise ValueError(f"subdominios: falta ':' en {entry!r}")
+        host, recipient = (part.strip() for part in entry.rsplit(":", 1))
+        host = host.lower().rstrip(".")
+        if (host == "upv.es" or not re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)*\.upv\.es", host)):
+            raise ValueError(f"subdominios: dominio inválido {host!r}")
+        if not re.fullmatch(r"[^@\s,:]+@[^@\s,:]+\.[^@\s,:]+", recipient):
+            raise ValueError(f"subdominios: correo inválido para {host}")
+        if host in routes:
+            raise ValueError(f"subdominios: dominio repetido {host}")
+        routes[host] = recipient
+    return sorted(routes.items(), key=lambda pair: (-len(pair[0]), pair[0]))
+
+
+def recipient_for_source(url, routes):
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    for domain, recipient in routes:
+        if host == domain or host.endswith("." + domain):
+            return recipient
+    return None
+
+
+def write_detail_report(path, findings, delimiter):
+    with path.open("w", encoding="utf-8-sig", newline="") as file:
+        writer = csv.writer(file, delimiter=delimiter)
+        writer.writerow(("fecha", "nivel", "pagina_origen", "enlace_roto", "texto_ancla", "resultado", "contexto_html"))
+        for level, stamp, source, target, anchor, detail, context in sorted(findings):
+            writer.writerow((stamp, level, source, target, anchor, detail, context))
+
+
 def write_grouped_report(path, groups, delimiter):
     with path.open("w", encoding="utf-8-sig", newline="") as file:
         writer = csv.writer(file, delimiter=delimiter)
@@ -544,7 +604,7 @@ def write_grouped_report(path, groups, delimiter):
                              ";".join(sorted(g["contexts"])), min(g["sources"])))
 
 
-def email_report(cfg, path, grouped_path, stats, findings, groups):
+def email_report(cfg, path, grouped_path, stats, findings, groups, recipients=None, scope=None):
     if not cfg.getboolean("mail", "enabled"):
         return
     server = cfg.get("mail", "smtp_server_address")
@@ -561,9 +621,9 @@ def email_report(cfg, path, grouped_path, stats, findings, groups):
     if not sender:
         raise ValueError("Falta from_address o el usuario SMTP en el entorno")
     msg["From"] = sender
-    msg["To"] = cfg.get("mail", "recipients")
+    msg["To"] = recipients or cfg.get("mail", "recipients")
     report_day = datetime.now(ZoneInfo(cfg.get("crawl", "report_timezone", fallback="Europe/Madrid"))).date()
-    msg["Subject"] = (f"UPV: revisión de enlaces {report_day} "
+    msg["Subject"] = (f"UPV: revisión de enlaces {report_day}" + (f" [{scope}]" if scope else "") + " "
                       f"({len({r[3] for r in findings})} destinos, {len(findings)} apariciones)")
     counts = defaultdict(lambda: {"targets": set(), "sources": set(), "rows": 0})
     for level, stamp, source, target, *_ in findings:
@@ -571,7 +631,8 @@ def email_report(cfg, path, grouped_path, stats, findings, groups):
         counts[key]["targets"].add(target)
         counts[key]["sources"].add(source)
         counts[key]["rows"] += 1
-    lines = ["Resumen de enlaces rotos", "Nivel | Día | Destinos distintos | Apariciones | Páginas afectadas"]
+    lines = ([f"Ámbito: {scope}"] if scope else []) + [
+        "Resumen de enlaces rotos", "Nivel | Día | Destinos distintos | Apariciones | Páginas afectadas"]
     for level, day in sorted(stats["levels"] | set(counts)):
         c = counts[(level, day)]
         lines.append(f"{level} | {day} | {len(c['targets'])} | {c['rows']} | {len(c['sources'])}")
@@ -599,10 +660,12 @@ def email_report(cfg, path, grouped_path, stats, findings, groups):
     lines.extend(describe(g) for g in selected_isolated)
     if len(groups) > len(selected_shared) + len(selected_isolated):
         lines.append(f"... {len(groups) - len(selected_shared) - len(selected_isolated)} grupos adicionales en el CSV agrupado")
-    lines.extend(["", f"Páginas procesadas: {stats['pages']}", f"Solicitudes HTTP: {stats['checked']}",
-                  f"Comprobaciones inciertas: {stats['unknown']}", f"Exclusiones robots: {stats['robots']}",
-                  f"Respuestas de throttling: {stats['throttled']}",
-                  f"Enlaces pendientes de reintento: {stats['pending_links']}",
+    lines.extend(["", f"Páginas procesadas en este ámbito: {stats['pages']}",
+                  f"Solicitudes HTTP totales del rastreo: {stats['checked']}",
+                  f"Comprobaciones inciertas totales: {stats['unknown']}",
+                  f"Exclusiones robots totales: {stats['robots']}",
+                  f"Respuestas de throttling totales: {stats['throttled']}",
+                  f"Enlaces pendientes de reintento totales: {stats['pending_links']}",
                   "CSV agrupado y detalle completo adjuntos.",
                   "El contexto HTML es una pista estructural; no prueba visibilidad en móvil."])
     msg.set_content("\n".join(lines) + "\n")
@@ -624,6 +687,53 @@ def email_report(cfg, path, grouped_path, stats, findings, groups):
             if attempt == 2:
                 raise
             time.sleep(2 ** attempt)
+
+
+def send_partitioned_reports(cfg, report_dir, run_stamp, delimiter, findings, stats, routes):
+    """Give each mailbox only findings from the source domains assigned to it."""
+    if not routes:
+        report = report_dir / f"enlaces_rotos_{run_stamp}.csv"
+        grouped = report_dir / f"enlaces_rotos_{run_stamp}_agrupados.csv"
+        email_report(cfg, report, grouped, stats, findings, group_findings(findings))
+        return
+
+    route_domains = defaultdict(list)
+    for domain, recipient in routes:
+        route_domains[recipient].append(domain)
+    finding_sets = defaultdict(set)
+    for finding in findings:
+        recipient = recipient_for_source(finding[2], routes)
+        finding_sets[recipient].add(finding)
+    scanned = defaultdict(set)
+    for level, day, source in stats["source_levels"]:
+        recipient = recipient_for_source(source, routes)
+        scanned[recipient].add((level, day, source))
+
+    delivery_errors = []
+    for recipient in [None, *route_domains]:
+        subset = finding_sets[recipient]
+        source_rows = scanned[recipient]
+        if recipient is not None and not subset and not source_rows:
+            continue  # No page or incident from this route in this execution.
+        suffix = "resto" if recipient is None else "dominio_" + hashlib.sha256(recipient.encode()).hexdigest()[:10]
+        detail_path = report_dir / f"enlaces_rotos_{run_stamp}_{suffix}.csv"
+        grouped_path = report_dir / f"enlaces_rotos_{run_stamp}_{suffix}_agrupados.csv"
+        write_detail_report(detail_path, subset, delimiter)
+        groups = group_findings(subset)
+        write_grouped_report(grouped_path, groups, delimiter)
+        segment_stats = dict(stats)
+        segment_stats["levels"] = {(level, day) for level, day, _ in source_rows}
+        segment_stats["pages"] = len({source for _, _, source in source_rows})
+        scope = "Resto UPV" if recipient is None else ", ".join(sorted(route_domains[recipient]))
+        try:
+            email_report(cfg, detail_path, grouped_path, segment_stats, subset, groups,
+                         recipients=recipient, scope=scope)
+        except (smtplib.SMTPException, OSError) as exc:
+            LOG.exception("No se pudo enviar el informe %s", scope)
+            delivery_errors.append((scope, exc))
+        LOG.info("Informe %s: %s apariciones, %s páginas procesadas", scope, len(subset), segment_stats["pages"])
+    if delivery_errors:
+        raise RuntimeError("Falló el envío de informes: " + ", ".join(scope for scope, _ in delivery_errors))
 
 
 def run_context_backfill(cfg, db, auditor, report_dir):
@@ -713,6 +823,7 @@ def run_context_backfill(cfg, db, auditor, report_dir):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--config", required=True)
+    ap.add_argument("--start-url", help="Raíz UPV alternativa; crea una base y carpeta de informes independientes")
     ap.add_argument("--backfill-context", action="store_true",
                     help="Actualizar solo el contexto HTML de enlaces antiguos, sin revisar sus destinos")
     args = ap.parse_args()
@@ -721,11 +832,24 @@ def main():
     if not cfg.read(args.config):
         ap.error("No se pudo leer la configuración")
     delimiter = csv_delimiter(cfg)
-    db_path = Path(cfg.get("paths", "database")).expanduser()
+    routes = subdomain_routes(cfg)
+    configured_root = normalize(cfg.get("crawl", "start_url"))
+    root = normalize(args.start_url) if args.start_url else configured_root
+    if root is None or not upv_page(root):
+        raise ValueError("start_url debe ser una URL HTTP(S) de upv.es o uno de sus subdominios")
+    base_db_path = Path(cfg.get("paths", "database")).expanduser()
+    db_path = base_db_path
     report_dir = Path(cfg.get("paths", "reports")).expanduser()
+    if args.start_url and root != configured_root:
+        host = urlsplit(root).hostname.replace(".", "_")
+        suffix = f"{host}-{hashlib.sha256(root.encode()).hexdigest()[:8]}"
+        db_path = db_path.with_name(f"{db_path.stem}-{suffix}{db_path.suffix}")
+        report_dir = report_dir / suffix
     db_path.parent.mkdir(parents=True, exist_ok=True)
     report_dir.mkdir(parents=True, exist_ok=True)
-    with open(str(db_path) + ".lock", "w") as lock:
+    # Every root from this configuration shares a lock: their per-host rate
+    # limiters are independent and must not make concurrent requests.
+    with open(str(base_db_path) + ".lock", "w") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -733,11 +857,9 @@ def main():
             return 2 if args.backfill_context else 0
         with connect(db_path) as db:
             auditor = Auditor(cfg, db)
+            bind_root(db, root)
             if args.backfill_context:
                 return run_context_backfill(cfg, db, auditor, report_dir)
-            root = normalize(cfg.get("crawl", "start_url"))
-            if root is None or not upv_page(root):
-                raise ValueError("start_url debe ser una URL HTTP(S) de upv.es o uno de sus subdominios")
             prune_old_data(db, auditor.retention_days, root)
             auditor.enqueue(root, 0)
             db.commit()
@@ -758,8 +880,8 @@ def main():
                     auditor.ensure_time()
                     r, detail, _ = auditor.check(target, cfg.getfloat("crawl", "link_ttl_days"), force=True)
                     if r == "unknown":
-                        root = f"{urlsplit(target).scheme}://{urlsplit(target).netloc}"
-                        if detail == "excluido por robots.txt" and auditor.robots.get(root) is not None:
+                        target_origin = f"{urlsplit(target).scheme}://{urlsplit(target).netloc}"
+                        if detail == "excluido por robots.txt" and auditor.robots.get(target_origin) is not None:
                             db.execute("DELETE FROM pending_links WHERE url=?", (target,))
                         else:
                             auditor.queue_uncertain_link(target, detail)
@@ -838,18 +960,14 @@ def main():
             auditor.stats["pending_links"] = db.execute("SELECT COUNT(*) FROM pending_links").fetchone()[0]
             run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             report = report_dir / f"enlaces_rotos_{run_stamp}.csv"
-            with report.open("w", encoding="utf-8-sig", newline="") as f:
-                writer = csv.writer(f, delimiter=delimiter)
-                writer.writerow(("fecha", "nivel", "pagina_origen", "enlace_roto", "texto_ancla", "resultado", "contexto_html"))
-                for level, event_stamp, source, target, anchor, detail, context in sorted(findings):
-                    writer.writerow((event_stamp, level, source, target, anchor, detail, context))
+            write_detail_report(report, findings, delimiter)
             groups = group_findings(findings)
             grouped_report = report_dir / f"enlaces_rotos_{run_stamp}_agrupados.csv"
             write_grouped_report(grouped_report, groups, delimiter)
             LOG.info("%s páginas; %s solicitudes; %s respuestas 429/503; %s enlaces pendientes; %s incidencias; informe: %s",
                      auditor.stats["pages"], auditor.stats["checked"], auditor.stats["throttled"],
                      auditor.stats["pending_links"], len(findings), report)
-            email_report(cfg, report, grouped_report, auditor.stats, findings, groups)
+            send_partitioned_reports(cfg, report_dir, run_stamp, delimiter, findings, auditor.stats, routes)
     return 0
 
 
